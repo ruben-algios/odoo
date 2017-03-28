@@ -123,7 +123,10 @@ class google_service(osv.osv_memory):
                 registry = openerp.modules.registry.RegistryManager.get(request.session.db)
                 with registry.cursor() as cur:
                     self.pool['res.users'].write(cur, uid, [uid], {'google_%s_rtoken' % service: False}, context=context)
-            error_key = simplejson.loads(e.read()).get("error", "nc")
+            try:
+                error_key = simplejson.loads(e.read()).get("error", "nc")
+            except:
+                error_key = str(e)
             _logger.exception("Bad google request : %s !" % error_key)
             error_msg = "Something went wrong during your token generation. Maybe your Authorization Code is invalid or already expired [%s]" % error_key
             raise self.pool.get('res.config.settings').get_config_warning(cr, _(error_msg), context=context)
