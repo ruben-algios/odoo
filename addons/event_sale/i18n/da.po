@@ -103,6 +103,8 @@ msgid ""
 "Determine if a product needs to create automatically an event registration "
 "at the confirmation of a sales order line."
 msgstr ""
+"Bestem, om et produkt automatisk skal oprette en eventregistrering ved "
+"bekræftelse af en salgsordrelinie."
 
 #. module: event_sale
 #: model:ir.model.fields,field_description:event_sale.field_event_event_ticket_display_name
