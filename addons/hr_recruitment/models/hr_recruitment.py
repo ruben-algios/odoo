@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
-import werkzeug
 from datetime import datetime
 
-from openerp import api, fields, models, tools
-from openerp.tools.translate import _
-from openerp.exceptions import UserError
+from odoo import api, fields, models, tools, SUPERUSER_ID
+from odoo.tools.translate import _
+from odoo.exceptions import UserError
 
 AVAILABLE_PRIORITIES = [
     ('0', 'Normal'),
@@ -22,22 +21,9 @@ class RecruitmentSource(models.Model):
     _inherits = {"utm.source": "source_id"}
 
     source_id = fields.Many2one('utm.source', "Source", ondelete='cascade', required=True)
-    url = fields.Char(string="Url parameters", compute='_compute_url')
-    email = fields.Char(related='alias_id.alias_name', string="Email", readonly=True)
+    email = fields.Char(related='alias_id.display_name', string="Email", readonly=True)
     job_id = fields.Many2one('hr.job', "Job ID")
     alias_id = fields.Many2one('mail.alias', "Alias ID")
-
-    @api.depends('source_id', 'source_id.name')
-    @api.one
-    def _compute_url(self):
-        if not self.alias_id.id:
-            self.url = ""
-        else:
-            self.url = werkzeug.url_encode({
-                'utm_campaign': self.env.ref('hr_recruitment.utm_campaign_job').name,
-                'utm_medium': self.env.ref('utm.utm_medium_website').name,
-                'utm_source': self.source_id.name
-            })
 
     @api.multi
     def create_alias(self):
@@ -65,19 +51,26 @@ class RecruitmentStage(models.Model):
 
     name = fields.Char("Stage name", required=True, translate=True)
     sequence = fields.Integer(
-        "Sequence", default=1,
+        "Sequence", default=10,
         help="Gives the sequence order when displaying a list of stages.")
-    job_ids = fields.Many2many(
-        'hr.job', 'job_stage_rel', 'stage_id', 'job_id',
-        string='Job Stages',
-        default=lambda self: [(4, self._context['default_job_id'])] if self._context.get('default_job_id') else None)
+    job_id = fields.Many2one('hr.job', string='Job Specific',
+                             ondelete='cascade',
+                             help='Specific job that uses this stage. Other jobs will not use this stage.')
     requirements = fields.Text("Requirements")
     template_id = fields.Many2one(
-        'mail.template', "Use template",
+        'mail.template', "Automated Email",
         help="If set, a message is posted on the applicant using the template when the applicant is set to the stage.")
     fold = fields.Boolean(
-        "Folded in Kanban View",
+        "Folded in Recruitment Pipe",
         help="This stage is folded in the kanban view when there are no records in that stage to display.")
+
+    @api.model
+    def default_get(self, fields):
+        if self._context and self._context.get('default_job_id') and not self._context.get('hr_recruitment_stage_mono', False):
+            context = dict(self._context)
+            context.pop('default_job_id')
+            self = self.with_context(context)
+        return super(RecruitmentStage, self).default_get(fields)
 
 
 class RecruitmentDegree(models.Model):
@@ -95,15 +88,18 @@ class Applicant(models.Model):
     _name = "hr.applicant"
     _description = "Applicant"
     _order = "priority desc, id desc"
-    _inherit = ['mail.thread', 'ir.needaction_mixin', 'utm.mixin']
-    _mail_mass_mailing = _('Applicants')
+    _inherit = ['mail.thread', 'mail.activity.mixin', 'utm.mixin']
 
     def _default_stage_id(self):
         if self._context.get('default_job_id'):
-            return self.env['hr.recruitment.stage'].search([
-                ('job_ids', '=', self._context['default_job_id']),
+            ids = self.env['hr.recruitment.stage'].search([
+                '|',
+                ('job_id', '=', False),
+                ('job_id', '=', self._context['default_job_id']),
                 ('fold', '=', False)
-            ], order='sequence asc', limit=1).ids[0]
+            ], order='sequence asc', limit=1).ids
+            if ids:
+                return ids[0]
         return False
 
     def _default_company_id(self):
@@ -123,43 +119,43 @@ class Applicant(models.Model):
                            help="These email addresses will be added to the CC field of all inbound and outbound emails for this record before being sent. Separate multiple email addresses with a comma")
     probability = fields.Float("Probability")
     partner_id = fields.Many2one('res.partner', "Contact")
-    create_date = fields.Datetime("Creation Date", readonly=True, select=True)
+    create_date = fields.Datetime("Creation Date", readonly=True, index=True)
     write_date = fields.Datetime("Update Date", readonly=True)
     stage_id = fields.Many2one('hr.recruitment.stage', 'Stage', track_visibility='onchange',
-                               domain="[('job_ids', '=', job_id)]", copy=False, select=1,
+                               domain="['|', ('job_id', '=', False), ('job_id', '=', job_id)]",
+                               copy=False, index=True,
+                               group_expand='_read_group_stage_ids',
                                default=_default_stage_id)
     last_stage_id = fields.Many2one('hr.recruitment.stage', "Last Stage",
                                     help="Stage of the applicant before being in the current stage. Used for lost cases analysis.")
     categ_ids = fields.Many2many('hr.applicant.category', string="Tags")
     company_id = fields.Many2one('res.company', "Company", default=_default_company_id)
     user_id = fields.Many2one('res.users', "Responsible", track_visibility="onchange", default=lambda self: self.env.uid)
-    date_closed = fields.Datetime("Closed", readonly=True, select=True)
-    date_open = fields.Datetime("Assigned", readonly=True, select=True)
-    date_last_stage_update = fields.Datetime("Last Stage Update", select=True, default=fields.Datetime.now)
-    date_action = fields.Date("Next Action Date")
-    title_action = fields.Char("Next Action", size=64)
+    date_closed = fields.Datetime("Closed", readonly=True, index=True)
+    date_open = fields.Datetime("Assigned", readonly=True, index=True)
+    date_last_stage_update = fields.Datetime("Last Stage Update", index=True, default=fields.Datetime.now)
     priority = fields.Selection(AVAILABLE_PRIORITIES, "Appreciation", default='0')
     job_id = fields.Many2one('hr.job', "Applied Job")
     salary_proposed_extra = fields.Char("Proposed Salary Extra", help="Salary Proposed by the Organisation, extra advantages")
     salary_expected_extra = fields.Char("Expected Salary Extra", help="Salary Expected by Applicant, extra advantages")
-    salary_proposed = fields.Float("Proposed Salary", help="Salary Proposed by the Organisation")
-    salary_expected = fields.Float("Expected Salary", help="Salary Expected by Applicant")
+    salary_proposed = fields.Float("Proposed Salary", group_operator="avg", help="Salary Proposed by the Organisation")
+    salary_expected = fields.Float("Expected Salary", group_operator="avg", help="Salary Expected by Applicant")
     availability = fields.Date("Availability", help="The date at which the applicant will be available to start working")
     partner_name = fields.Char("Applicant's Name")
     partner_phone = fields.Char("Phone", size=32)
     partner_mobile = fields.Char("Mobile", size=32)
     type_id = fields.Many2one('hr.recruitment.degree', "Degree")
     department_id = fields.Many2one('hr.department', "Department")
-    survey = fields.Many2one('survey.survey', related='job_id.survey_id', string="Survey")  # TDE FIXME: rename to survey_id
-    response_id = fields.Many2one('survey.user_input', "Response", ondelete="set null", oldname="response")
     reference = fields.Char("Referred By")
     day_open = fields.Float(compute='_compute_day', string="Days to Open")
     day_close = fields.Float(compute='_compute_day', string="Days to Close")
+    delay_close = fields.Float(compute="_compute_day", string='Delay to Close', readonly=True, group_operator="avg", help="Number of days to close", store=True)
     color = fields.Integer("Color Index", default=0)
     emp_id = fields.Many2one('hr.employee', string="Employee", track_visibility="onchange", help="Employee linked to the applicant.")
     user_email = fields.Char(related='user_id.email', type="char", string="User Email", readonly=True)
     attachment_number = fields.Integer(compute='_get_attachment_number', string="Number of Attachments")
     employee_name = fields.Char(related='emp_id.name', string="Employee Name")
+    attachment_ids = fields.One2many('ir.attachment', 'res_id', domain=[('res_model', '=', 'hr.applicant')], string='Attachments')
 
     @api.depends('date_open', 'date_closed')
     @api.one
@@ -173,6 +169,7 @@ class Applicant(models.Model):
             date_create = datetime.strptime(self.create_date, tools.DEFAULT_SERVER_DATETIME_FORMAT)
             date_closed = datetime.strptime(self.date_closed, tools.DEFAULT_SERVER_DATETIME_FORMAT)
             self.day_close = (date_closed - date_create).total_seconds() / (24.0 * 3600)
+            self.delay_close = self.day_close - self.day_open
 
     @api.multi
     def _get_attachment_number(self):
@@ -184,44 +181,17 @@ class Applicant(models.Model):
             record.attachment_number = attach_data.get(record.id, 0)
 
     @api.model
-    def _read_group_stage_ids(self, ids, domain, read_group_order=None, access_rights_uid=None):
-        access_rights_uid = access_rights_uid or self.env.uid
-        Stage = self.env['hr.recruitment.stage']
-        order = Stage._order
-        # lame hack to allow reverting search, should just work in the trivial case
-        if read_group_order == 'stage_id desc':
-            order = "%s desc" % order
+    def _read_group_stage_ids(self, stages, domain, order):
         # retrieve job_id from the context and write the domain: ids + contextual columns (job or default)
         job_id = self._context.get('default_job_id')
-        department_id = self._context.get('default_department_id')
-        search_domain = []
+        search_domain = [('job_id', '=', False)]
         if job_id:
-            search_domain = [('job_ids', '=', job_id)]
-        if department_id:
-            if search_domain:
-                search_domain = ['|', ('job_ids.department_id', '=', department_id)] + search_domain
-            else:
-                search_domain = [('job_ids.department_id', '=', department_id)]
-        if self.ids:
-            if search_domain:
-                search_domain = ['|', ('id', 'in', self.ids)] + search_domain
-            else:
-                search_domain = [('id', 'in', self.ids)]
+            search_domain = ['|', ('job_id', '=', job_id)] + search_domain
+        if stages:
+            search_domain = ['|', ('id', 'in', stages.ids)] + search_domain
 
-        stage_ids = Stage._search(search_domain, order=order, access_rights_uid=access_rights_uid)
-        stages = Stage.sudo(access_rights_uid).browse(stage_ids)
-        result = stages.name_get()
-        # restore order of the search
-        result.sort(lambda x, y: cmp(stage_ids.index(x[0]), stage_ids.index(y[0])))
-
-        fold = {}
-        for stage in stages:
-            fold[stage.id] = stage.fold or False
-        return result, fold
-
-    _group_by_full = {
-        'stage_id': _read_group_stage_ids
-    }
+        stage_ids = stages._search(search_domain, order=order, access_rights_uid=SUPERUSER_ID)
+        return stages.browse(stage_ids)
 
     @api.onchange('job_id')
     def onchange_job_id(self):
@@ -239,10 +209,13 @@ class Applicant(models.Model):
             department_id = job.department_id.id
             user_id = job.user_id.id
             if not self.stage_id:
-                stage_id = self.env['hr.recruitment.stage'].search([
-                    ('job_ids', '=', job.id),
+                stage_ids = self.env['hr.recruitment.stage'].search([
+                    '|',
+                    ('job_id', '=', False),
+                    ('job_id', '=', job.id),
                     ('fold', '=', False)
-                ], order='sequence asc', limit=1).ids[0]
+                ], order='sequence asc', limit=1).ids
+                stage_id = stage_ids[0] if stage_ids else False
 
         return {'value': {
             'department_id': department_id,
@@ -276,20 +249,14 @@ class Applicant(models.Model):
             self = self.with_context(default_department_id=vals.get('department_id'))
         if vals.get('job_id') or self._context.get('default_job_id'):
             job_id = vals.get('job_id') or self._context.get('default_job_id')
-            for key, value in self._onchange_job_id_internal(job_id)['value'].iteritems():
+            for key, value in self._onchange_job_id_internal(job_id)['value'].items():
                 if key not in vals:
                     vals[key] = value
         if vals.get('user_id'):
             vals['date_open'] = fields.Datetime.now()
         if 'stage_id' in vals:
             vals.update(self._onchange_stage_id_internal(vals.get('stage_id'))['value'])
-        applicant = super(Applicant, self.with_context(mail_create_nolog=True)).create(vals)
-        if applicant.job_id:
-            name = applicant.partner_name if applicant.partner_name else applicant.name
-            applicant.job_id.message_post(
-                body=_('New application from %s') % name,
-                subtype="hr_recruitment.mt_job_applicant_new")
-        return applicant
+        return super(Applicant, self.with_context(mail_create_nolog=True)).create(vals)
 
     @api.multi
     def write(self, vals):
@@ -305,48 +272,7 @@ class Applicant(models.Model):
                 res = super(Applicant, self).write(vals)
         else:
             res = super(Applicant, self).write(vals)
-
-        # post processing: if job changed, post a message on the job
-        if vals.get('job_id'):
-            for applicant in self:
-                name = applicant.partner_name if applicant.partner_name else applicant.name
-                self.env['hr.job'].browse([vals['job_id']]).message_post(
-                    body=_('New application from %s') % name,
-                    subtype="hr_recruitment.mt_job_applicant_new")
-
-        # post processing: if stage changed, post a message in the chatter
-        if vals.get('stage_id'):
-            if self.stage_id.template_id:
-                # TDENOTE: probably factorize me in a message_post_with_template generic method FIXME
-                composer = self.env['mail.compose.message'].with_context(active_ids=self.ids).create(
-                    {
-                        'model': self._name,
-                        'composition_mode': 'mass_mail',
-                        'template_id': self.stage_id.template_id.id,
-                        'notify': True,
-                    })
-                values = composer.onchange_template_id(
-                    self.stage_id.template_id.id, 'mass_mail', self._name, False)['value']
-                if values.get('attachment_ids'):
-                    values['attachment_ids'] = [(6, 0, values['attachment_ids'])]
-                composer.write(values)
-                composer.send_mail()
         return res
-
-    @api.model
-    def _broadcast_welcome(self):
-        """ Broadcast the welcome message to all users in the employee company. """
-        IrModelData = self.env['ir.model.data']
-        channel_all_employees = IrModelData.xmlid_to_object('mail.channel_all_employees')
-        template_new_employee = IrModelData.xmlid_to_object('hr_recruitment.hr_welcome_new_employee')
-        if template_new_employee:
-            MailTemplate = self.env['mail.template']
-            body_html = MailTemplate.render_template(template_new_employee.body_html, 'hr.employee', self.id)
-            subject = MailTemplate.render_template(template_new_employee.subject, 'hr.employee', self.id)
-            channel_all_employees.message_post(
-                body=body_html, subject=subject,
-                subtype='mail.mt_comment')
-        return True
 
     @api.model
     def get_empty_list_help(self, help):
@@ -367,13 +293,12 @@ class Applicant(models.Model):
             @return: Dictionary value for created Meeting view
         """
         self.ensure_one()
-        partners = self.partner_id
-        if self.department_id and self.department_id.manager_id and self.department_id.manager_id.user_id:
-            partners |= self.department_id.manager_id.user_id.partner_id
+        partners = self.partner_id | self.user_id.partner_id | self.department_id.manager_id.user_id.partner_id
 
         category = self.env.ref('hr_recruitment.categ_meet_interview')
         res = self.env['ir.actions.act_window'].for_xml_id('calendar', 'action_calendar_event')
         res['context'] = {
+            'search_default_partner_ids': self.partner_id.name,
             'default_partner_ids': partners.ids,
             'default_user_id': self.env.uid,
             'default_name': self.name,
@@ -382,39 +307,27 @@ class Applicant(models.Model):
         return res
 
     @api.multi
-    def action_start_survey(self):
-        self.ensure_one()
-        # create a response and link it to this applicant
-        if not self.response_id:
-            response = self.env['survey.user_input'].create({'survey_id': self.survey.id, 'partner_id': self.partner_id.id})
-            self.response_id = response.id
-        else:
-            response = self.response_id
-        # grab the token of the response and start surveying
-        return self.survey.with_context(survey_token=response.token).action_start_survey()
-
-    @api.multi
-    def action_print_survey(self):
-        """ If response is available then print this response otherwise print survey form (print template of the survey) """
-        self.ensure_one()
-        if not self.response_id:
-            return self.survey.action_print_survey()
-        else:
-            response = self.response_id
-            return self.survey.with_context(survey_token=response.token).action_print_survey()
-
-    @api.multi
     def action_get_attachment_tree_view(self):
         attachment_action = self.env.ref('base.action_attachment')
         action = attachment_action.read()[0]
         action['context'] = {'default_res_model': self._name, 'default_res_id': self.ids[0]}
         action['domain'] = str(['&', ('res_model', '=', self._name), ('res_id', 'in', self.ids)])
+        action['search_view_id'] = (self.env.ref('hr_recruitment.ir_attachment_view_search_inherit_hr_recruitment').id, )
         return action
+
+    @api.multi
+    def _track_template(self, tracking):
+        res = super(Applicant, self)._track_template(tracking)
+        applicant = self[0]
+        changes, dummy = tracking[applicant.id]
+        if 'stage_id' in changes and applicant.stage_id.template_id:
+            res['stage_id'] = (applicant.stage_id.template_id, {'composition_mode': 'mass_mail'})
+        return res
 
     @api.multi
     def _track_subtype(self, init_values):
         record = self[0]
-        if 'emp_id' in init_values and record.emp_id:
+        if 'emp_id' in init_values and record.emp_id and record.emp_id.active:
             return 'hr_recruitment.mt_applicant_hired'
         elif 'stage_id' in init_values and record.stage_id and record.stage_id.sequence <= 1:
             return 'hr_recruitment.mt_applicant_new'
@@ -445,13 +358,17 @@ class Applicant(models.Model):
             through message_process.
             This override updates the document according to the email.
         """
+        # remove default author when going through the mail gateway. Indeed we
+        # do not want to explicitly set user_id to False; however we do not
+        # want the gateway user to be responsible if no other responsible is
+        # found.
+        self = self.with_context(default_user_id=False)
         val = msg.get('from').split('<')[0]
         defaults = {
             'name': msg.get('subject') or _("No Subject"),
             'partner_name': val,
             'email_from': msg.get('from'),
             'email_cc': msg.get('cc'),
-            'user_id': False,
             'partner_id': msg.get('author_id', False),
         }
         if msg.get('priority'):
@@ -460,24 +377,50 @@ class Applicant(models.Model):
             defaults.update(custom_values)
         return super(Applicant, self).message_new(msg, custom_values=defaults)
 
+    def _message_post_after_hook(self, message):
+        if self.email_from and not self.partner_id:
+            # we consider that posting a message with a specified recipient (not a follower, a specific one)
+            # on a document without customer means that it was created through the chatter using
+            # suggested recipients. This heuristic allows to avoid ugly hacks in JS.
+            new_partner = message.partner_ids.filtered(lambda partner: partner.email == self.email_from)
+            if new_partner:
+                self.search([
+                    ('partner_id', '=', False),
+                    ('email_from', '=', new_partner.email),
+                    ('stage_id.fold', '=', False)]).write({'partner_id': new_partner.id})
+        return super(Applicant, self)._message_post_after_hook(message)
+
     @api.multi
     def create_employee_from_applicant(self):
         """ Create an hr.employee from the hr.applicants """
         employee = False
         for applicant in self:
-            address_id = contact_name = False
+            contact_name = False
             if applicant.partner_id:
                 address_id = applicant.partner_id.address_get(['contact'])['contact']
                 contact_name = applicant.partner_id.name_get()[0][1]
+            else :
+                new_partner_id = self.env['res.partner'].create({
+                    'is_company': False,
+                    'name': applicant.partner_name,
+                    'email': applicant.email_from,
+                    'phone': applicant.partner_phone,
+                    'mobile': applicant.partner_mobile
+                })
+                address_id = new_partner_id.address_get(['contact'])['contact']
             if applicant.job_id and (applicant.partner_name or contact_name):
                 applicant.job_id.write({'no_of_hired_employee': applicant.job_id.no_of_hired_employee + 1})
-                employee = self.env['hr.employee'].create({'name': applicant.partner_name or contact_name,
-                                               'job_id': applicant.job_id.id,
-                                               'address_home_id': address_id,
-                                               'department_id': applicant.department_id.id or False,
-                                               'address_id': applicant.company_id and applicant.company_id.partner_id and applicant.company_id.partner_id.id or False,
-                                               'work_email': applicant.department_id and applicant.department_id.company_id and applicant.department_id.company_id.email or False,
-                                               'work_phone': applicant.department_id and applicant.department_id.company_id and applicant.department_id.company_id.phone or False})
+                employee = self.env['hr.employee'].create({
+                    'name': applicant.partner_name or contact_name,
+                    'job_id': applicant.job_id.id,
+                    'address_home_id': address_id,
+                    'department_id': applicant.department_id.id or False,
+                    'address_id': applicant.company_id and applicant.company_id.partner_id
+                            and applicant.company_id.partner_id.id or False,
+                    'work_email': applicant.department_id and applicant.department_id.company_id
+                            and applicant.department_id.company_id.email or False,
+                    'work_phone': applicant.department_id and applicant.department_id.company_id
+                            and applicant.department_id.company_id.phone or False})
                 applicant.write({'emp_id': employee.id})
                 applicant.job_id.message_post(
                     body=_('New Employee %s Hired') % applicant.partner_name if applicant.partner_name else applicant.name,
@@ -493,9 +436,24 @@ class Applicant(models.Model):
         dict_act_window['view_mode'] = 'form,tree'
         return dict_act_window
 
+    @api.multi
+    def archive_applicant(self):
+        self.write({'active': False})
 
-class applicant_category(models.Model):
+    @api.multi
+    def reset_applicant(self):
+        """ Reinsert the applicant into the recruitment pipe in the first stage"""
+        default_stage_id = self._default_stage_id()
+        self.write({'active': True, 'stage_id': default_stage_id})
+
+
+class ApplicantCategory(models.Model):
     _name = "hr.applicant.category"
     _description = "Category of applicant"
 
-    name = fields.Char("Name", required=True, translate=True)
+    name = fields.Char("Name", required=True)
+    color = fields.Integer(string='Color Index', default=10)
+
+    _sql_constraints = [
+            ('name_uniq', 'unique (name)', "Tag name already exists !"),
+    ]

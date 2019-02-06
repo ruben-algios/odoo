@@ -1,5 +1,6 @@
 # -*- encoding: utf-8 -*-
 
-import account_bank_statement_import
+from . import account_bank_statement_import
+from . import account_journal
 
-import wizard
+from . import wizard

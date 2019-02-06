@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import payment_acquirer
-import res_config
-import res_partner
+from . import payment_acquirer
+from . import res_partner
+from . import account_payment
+from . import chart_template
